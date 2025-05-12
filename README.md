@@ -2,6 +2,6 @@
 Convert Splunk Webhook json to send it to Alertmanager
 
 
-To build
+To build the code
 
 go build -o splunk2am  ./cmd/server
