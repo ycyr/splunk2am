@@ -1,0 +1,157 @@
+package alertmanager
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strconv"
+	"time"
+
+	"log/slog"
+
+	"github.com/ycyr/splunk2alertmanager/pkg/config"
+)
+
+// SplunkPayload represents the incoming Splunk webhook payload
+type SplunkPayload struct {
+	Sid         string                 `json:"sid"`
+	SearchName  string                 `json:"search_name"`
+	App         string                 `json:"app"`
+	Owner       string                 `json:"owner"`
+	ResultsLink string                 `json:"results_link"`
+	Result      map[string]interface{} `json:"result"` // Use interface{} for dynamic types
+}
+
+// V2Alert represents an individual alert in the Alertmanager v2 payload
+type V2Alert struct {
+	Status       string            `json:"status"`
+	Labels       map[string]string `json:"labels"`
+	Annotations  map[string]string `json:"annotations"`
+	StartsAt     time.Time         `json:"startsAt"`
+	EndsAt       *time.Time        `json:"endsAt,omitempty"`
+	GeneratorURL string            `json:"generatorURL"`
+}
+
+func HandleSplunkWebhook(w http.ResponseWriter, r *http.Request, cfg config.Config, logger *slog.Logger) {
+	// Parse the incoming Splunk payload
+	var splunkPayload SplunkPayload
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Failed to read request body", http.StatusBadRequest)
+		logger.Error("Failed to read request body", "error", err)
+		return
+	}
+	if err := json.Unmarshal(body, &splunkPayload); err != nil {
+		http.Error(w, "Failed to parse JSON", http.StatusBadRequest)
+		logger.Error("Failed to parse JSON", "error", err)
+		return
+	}
+
+	// Log the received Splunk payload
+	logger.Debug("Received Splunk payload", "payload", splunkPayload)
+
+	// Extract the trigger time from the result field (expected to be a Unix timestamp)
+	triggerTimeStr, ok := splunkPayload.Result["_time"].(string)
+	if !ok {
+		http.Error(w, "Invalid or missing trigger time", http.StatusBadRequest)
+		logger.Error("Invalid or missing trigger time in Splunk payload")
+		return
+	}
+
+	// Convert the trigger time from Unix timestamp to time.Time
+	triggerTimeUnix, err := strconv.ParseInt(triggerTimeStr, 10, 64)
+	if err != nil {
+		http.Error(w, "Invalid trigger time format", http.StatusBadRequest)
+		logger.Error("Invalid trigger time format", "trigger_time", triggerTimeStr, "error", err)
+		return
+	}
+	startsAt := time.Unix(triggerTimeUnix, 0)
+
+	// Calculate the EndsAt time if the endsAtDuration argument is provided
+	var endsAt *time.Time
+	if cfg.EndsAtDuration != "" {
+		duration, err := time.ParseDuration(cfg.EndsAtDuration)
+		if err != nil {
+			http.Error(w, "Invalid ends-at duration", http.StatusBadRequest)
+			logger.Error("Invalid ends-at duration", "ends_at_duration", cfg.EndsAtDuration, "error", err)
+			return
+		}
+		endsAtTime := startsAt.Add(duration)
+		endsAt = &endsAtTime
+		logger.Info("Calculated EndsAt time", "ends_at", *endsAt)
+	} else {
+		logger.Info("No EndsAt time set")
+	}
+
+	// Filter the default labels and any additional labels provided in the config
+	defaultLabels := []string{"_raw", "host", "index", "name", "source", "sourcetype"}
+	labels := make(map[string]string)
+
+	// Add default labels
+	for _, key := range defaultLabels {
+		if value, ok := splunkPayload.Result[key]; ok {
+			if strVal, ok := value.(string); ok {
+				labels[key] = strVal
+			}
+		}
+	}
+
+	// Add additional labels if specified
+	for _, key := range cfg.AdditionalLabels {
+		if key == "" {
+			continue // Skip empty strings from split
+		}
+		if value, ok := splunkPayload.Result[key]; ok {
+			if strVal, ok := value.(string); ok {
+				labels[key] = strVal
+			}
+		}
+	}
+
+	// Transform the Splunk payload to an Alertmanager v2 alert
+	v2Alert := V2Alert{
+		Status:       "firing",
+		Labels:       labels,
+		Annotations:  map[string]string{"summary": fmt.Sprintf("Alert triggered in Splunk: %s", splunkPayload.SearchName), "link": splunkPayload.ResultsLink},
+		StartsAt:     startsAt,
+		EndsAt:       endsAt,
+		GeneratorURL: splunkPayload.ResultsLink,
+	}
+
+	// Wrap the alert in an array to match the Alertmanager v2 API format
+	alertmanagerV2Payload := []V2Alert{v2Alert}
+
+	// Convert the Alertmanager v2 payload to JSON
+	payloadBytes, err := json.Marshal(alertmanagerV2Payload)
+	if err != nil {
+		http.Error(w, "Failed to serialize Alertmanager payload", http.StatusInternalServerError)
+		logger.Error("Failed to serialize Alertmanager payload", "error", err)
+		return
+	}
+
+	// Log the JSON payload for debugging
+	logger.Debug("Sending payload to Alertmanager", "payload", string(payloadBytes))
+
+	// Send the payload to Alertmanager using the v2 API endpoint
+	resp, err := http.Post(cfg.AlertmanagerURL+"/api/v2/alerts", "application/json", bytes.NewBuffer(payloadBytes))
+	if err != nil {
+		http.Error(w, "Failed to send payload to Alertmanager", http.StatusInternalServerError)
+		logger.Error("Failed to send payload to Alertmanager", "error", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		http.Error(w, fmt.Sprintf("Error from Alertmanager: %s", string(bodyBytes)), http.StatusInternalServerError)
+		logger.Error("Error from Alertmanager", "response", string(bodyBytes))
+		return
+	}
+
+	// Respond back to Splunk with a success message
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintln(w, "Payload successfully forwarded to Alertmanager")
+	logger.Info("Payload successfully forwarded to Alertmanager")
+}
