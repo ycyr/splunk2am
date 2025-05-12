@@ -9,9 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"log/slog"
-
 	"github.com/ycyr/splunk2alertmanager/pkg/config"
+	"log/slog"
 )
 
 // SplunkWebhook represents the incoming Splunk webhook payload
@@ -61,39 +60,33 @@ func HandleSplunkWebhook(w http.ResponseWriter, r *http.Request, cfg config.Conf
 	labels := make(map[string]string)
 	annotations := make(map[string]string)
 
-	// Use the user-defined annotation prefix
 	annotationPrefix := cfg.AnnotationPrefix
 	logger.Debug("Using annotation prefix", "prefix", annotationPrefix)
 
 	for key, value := range splunkPayload.Result {
 		if strVal, ok := value.(string); ok {
 			if strings.HasPrefix(key, annotationPrefix) {
-				// Store in annotations, remove the user-defined prefix
+				// Store in annotations, remove the prefix
 				cleanKey := strings.TrimPrefix(key, annotationPrefix)
 				annotations[cleanKey] = strVal
 			} else {
-				// Store in labels
 				labels[key] = strVal
 			}
 		}
 	}
 
-	// Add static labels to identify the source of this alert
+	// Add static labels
 	labels["alertname"] = splunkPayload.SearchName
 	labels["app"] = splunkPayload.App
 
-	// The "summary" and "link" should go into annotations
+	// Add summary to annotations only (no "link")
 	annotations["summary"] = fmt.Sprintf("Alert triggered in Splunk: %s", splunkPayload.SearchName)
-	annotations["link"] = splunkPayload.ResultsLink
 
-	// Log the extracted labels and annotations for debugging
 	logger.Debug("Final Labels", "labels", labels)
 	logger.Debug("Final Annotations", "annotations", annotations)
 
-	// Assume the timestamp for "StartsAt" is the current time (time the webhook was received)
 	startsAt := time.Now()
 
-	// Calculate the EndsAt time if the endsAtDuration argument is provided
 	var endsAt *time.Time
 	if cfg.EndsAtDuration != "" {
 		duration, err := time.ParseDuration(cfg.EndsAtDuration)
@@ -109,7 +102,7 @@ func HandleSplunkWebhook(w http.ResponseWriter, r *http.Request, cfg config.Conf
 		logger.Info("No EndsAt time set")
 	}
 
-	// Transform the Splunk payload to an Alertmanager v2 alert
+	// Build the Alertmanager v2 alert
 	v2Alert := V2Alert{
 		Status:       "firing",
 		Labels:       labels,
@@ -119,10 +112,8 @@ func HandleSplunkWebhook(w http.ResponseWriter, r *http.Request, cfg config.Conf
 		GeneratorURL: splunkPayload.ResultsLink,
 	}
 
-	// Wrap the alert in an array to match the Alertmanager v2 API format
 	alertmanagerV2Payload := []V2Alert{v2Alert}
 
-	// Convert the Alertmanager v2 payload to JSON
 	payloadBytes, err := json.Marshal(alertmanagerV2Payload)
 	if err != nil {
 		http.Error(w, "Failed to serialize Alertmanager payload", http.StatusInternalServerError)
@@ -130,10 +121,8 @@ func HandleSplunkWebhook(w http.ResponseWriter, r *http.Request, cfg config.Conf
 		return
 	}
 
-	// Log the JSON payload for debugging
 	logger.Debug("Sending payload to Alertmanager", "payload", string(payloadBytes))
 
-	// Send the payload to Alertmanager using the v2 API endpoint
 	resp, err := http.Post(cfg.AlertmanagerURL+"/api/v2/alerts", "application/json", bytes.NewBuffer(payloadBytes))
 	if err != nil {
 		http.Error(w, "Failed to send payload to Alertmanager", http.StatusInternalServerError)
@@ -142,8 +131,15 @@ func HandleSplunkWebhook(w http.ResponseWriter, r *http.Request, cfg config.Conf
 	}
 	defer resp.Body.Close()
 
-	// Respond back to Splunk with a success message
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		http.Error(w, fmt.Sprintf("Error from Alertmanager: %s", string(bodyBytes)), http.StatusInternalServerError)
+		logger.Error("Error from Alertmanager", "response", string(bodyBytes))
+		return
+	}
+
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintln(w, "Payload successfully forwarded to Alertmanager")
 	logger.Info("Payload successfully forwarded to Alertmanager")
 }
+
