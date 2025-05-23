@@ -1,8 +1,6 @@
 package main
 
 import (
-	"flag"
-	"fmt"
 	"os"
 
 	"github.com/ycyr/splunk2alertmanager/pkg/api"
@@ -10,25 +8,16 @@ import (
 	"github.com/ycyr/splunk2alertmanager/pkg/logger"
 )
 
-var version string // set via -ldflags "-X main.version=..."
+var version string // set via -ldflags "-X main.version=..." during build
 
 func main() {
-	// Version flag
-	showVersion := flag.Bool("version", false, "Print the version and exit")
-	flag.Parse()
-	if *showVersion {
-		if version == "" {
-			fmt.Println("Version: unknown")
-		} else {
-			fmt.Printf("Version: %s\n", version)
-		}
-		os.Exit(0)
-	}
-
+	// Load configuration
 	cfg := config.LoadConfig()
 
+	// Initialize logger with log level and format
 	log := logger.NewLogger(cfg.LogLevel, cfg.LogFormat)
 
+	// Start HTTP server
 	log.Info("Starting HTTP server", "bind_address", cfg.BindAddress)
 	if err := api.StartServer(cfg, log); err != nil {
 		log.Error("Failed to start HTTP server", "error", err)
